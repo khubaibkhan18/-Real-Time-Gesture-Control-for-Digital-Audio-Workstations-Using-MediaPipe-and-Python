@@ -15,18 +15,19 @@ latest_results = {"Left": None, "Right": None}
 last_pinch_value = {"Right": None}
 FREEZE_THRESHOLD = 0.75
 
-# MIDI setup
+# --- MIDI setup ---
 midiout = rtmidi.MidiOut()
-midiout.open_port(1)         # use port 1 (From_Python)
+print(midiout.get_ports())   # check console - confirm correct port index below
+midiout.open_port(0)         # adjust index based on what's printed above
 
-# Scale setup
+# --- Scale setup ---
 ROOT_NOTE = 60  # C4
 PENTATONIC_INTERVALS = [0, 2, 4, 7, 9]  # major pentatonic semitone steps
 NUM_STEPS = len(PENTATONIC_INTERVALS) * 2  # 2 octaves = 10 steps
 
 active_note = {"Right": None}
 
-# Load gesture config
+# --- Load gesture config ---
 with open("gesture_config.json") as f:
     gesture_config = json.load(f)
 
@@ -43,7 +44,8 @@ def calculate_pinch_distance(landmarks, normalize=True):
     if not normalize:
         return raw_distance
 
-    # wrist-to-middle-knuckle for stability
+    # wrist-to-middle-knuckle as a stable reference for hand size,
+    # so pinch distance stays consistent regardless of camera distance
     wrist = landmarks[0]
     middle_knuckle = landmarks[9]
     hand_scale = math.sqrt(
@@ -85,9 +87,9 @@ def update_note(hand_label, note, velocity):
         return  # already playing this note
 
     if current is not None:
-        midiout.send_message([0x80, current, 0])  # note off for old note
+        midiout.send_message([0x80, current, 0])  # note off - old note
 
-    midiout.send_message([0x90, note, velocity])  # note on for new note
+    midiout.send_message([0x90, note, velocity])  # note on - new note
     active_note[hand_label] = note
 
 
@@ -99,7 +101,9 @@ def release_note(hand_label):
 
 
 def result_callback(result, output_image, timestamp_ms):
-
+    """
+    Called automatically by MediaPipe after a frame is processed
+    """
     latest_results["Left"] = None
     latest_results["Right"] = None
 
@@ -173,11 +177,12 @@ while True:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         if label == "Right":
-            # --- Note control: index fingertip Y, always active ---
-            index_tip = landmarks[8]
-            note = fingertip_to_note(index_tip.y)
+            # Note control: MIDDLE fingertip Y
+            # Using the middle finger (not index) so pinching for volume
+            # doesn't also disturb the note pitch
+            middle_tip = landmarks[12]
+            note = fingertip_to_note(middle_tip.y)
 
-            # --- Volume control: pinch distance, freezes past threshold ---
             raw_pinch = calculate_pinch_distance(landmarks)
             if raw_pinch < FREEZE_THRESHOLD:
                 last_pinch_value["Right"] = raw_pinch
