@@ -1,0 +1,41 @@
+{
+  "Right": {
+    "note_control": {
+      "type": "continuous_note",
+      "description": "index fingertip Y maps to pentatonic scale note"
+    },
+    "volume_control": {
+      "type": "continuous_cc",
+      "target": "volume",
+      "description": "pinch distance maps to velocity, freezes past threshold"
+    }
+  },
+  "Left": {
+    "Open_Palm": {
+      "type": "continuous_cc",
+      "target": "filter_cutoff",
+      "description": "hand Y maps to filter cutoff"
+    },
+    "Closed_Fist": {
+      "type": "continuous_boost",
+      "target": "effect_intensity",
+      "description": "intensifies the longer fist is held"
+    },
+    "Thumb_Up": {
+      "type": "trigger",
+      "action": "start_recording"
+    },
+    "Thumb_Down": {
+      "type": "trigger",
+      "action": "stop_recording"
+    },
+    "Victory": {
+      "type": "trigger",
+      "action": "toggle_clip"
+    },
+    "ILoveYou": {
+      "type": "trigger",
+      "action": "fun_effect"
+    }
+  }
+}
