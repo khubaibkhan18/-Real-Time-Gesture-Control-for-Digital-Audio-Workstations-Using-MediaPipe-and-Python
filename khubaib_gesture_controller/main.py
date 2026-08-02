@@ -3,6 +3,7 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 from mediapipe.framework.formats import landmark_pb2
+import math
 
 mp_hands = mp.solutions.hands  # used for HAND_CONNECTIONS
 mp_draw = mp.solutions.drawing_utils
@@ -10,6 +11,14 @@ mp_draw = mp.solutions.drawing_utils
 # both hands track independently
 latest_results = {"Left": None, "Right": None}
 
+def calculate_pinch_distance(landmarks):
+    thumb_tip = landmarks[4]
+    index_tip = landmarks[8]
+    distance = math.sqrt(
+        (thumb_tip.x - index_tip.x) ** 2 +
+        (thumb_tip.y - index_tip.y) ** 2
+    )
+    return distance
 
 def result_callback(result, output_image, timestamp_ms):
     """
@@ -86,6 +95,12 @@ while True:
         text_x, text_y = int(wrist.x * w), int(wrist.y * h) - 20
         cv2.putText(frame, f"{label}: {gesture_name}", (text_x, text_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        if label == "Right":
+            pinch_distance = calculate_pinch_distance(landmarks)
+            print(f"Pinch distance: {pinch_distance:.3f}")
+
+            cv2.putText(frame, f"Pinch: {pinch_distance:.3f}", (text_x, text_y + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
     cv2.imshow("Gesture Recognition", frame)
 
