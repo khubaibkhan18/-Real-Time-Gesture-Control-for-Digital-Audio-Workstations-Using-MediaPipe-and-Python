@@ -22,7 +22,8 @@ def result_callback(result, output_image, timestamp_ms):
         for gestures, handedness, landmarks in zip(result.gestures,
                                                      result.handedness,
                                                      result.hand_landmarks):
-            label = handedness[0].category_name  # Left or right
+            raw_label = handedness[0].category_name
+            label = "Left" if raw_label == "Right" else "Right"  #  as image is flipped
             gesture_name = gestures[0].category_name  # something like closed fist
             latest_results[label] = {
                 "gesture": gesture_name,
