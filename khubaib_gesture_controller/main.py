@@ -21,7 +21,8 @@ last_pinch_value = {"Right": None}
 FREEZE_THRESHOLD = 0.75
 
 previous_gesture = {"Left": None, "Right": None}
-loop_is_playing = {"Right": True}
+loop_is_playing = {}
+
 frame_timestamp = 0
 
 # --- MIDI setup ---
@@ -33,11 +34,15 @@ ip = "127.0.0.1"
 to_ableton = 11000
 osc_client = SimpleUDPClient(ip, to_ableton)
 
-LOOP_TRACK = 1
-LOOP_CLIP = 0
+# Allows multiple recordings
 
-osc_client.send_message("/live/track/set/arm", [LOOP_TRACK, 1])
-print(f"Armed track {LOOP_TRACK} for recording")
+LOOP_TRACKS = [0, 1, 2]
+LOOP_CLIP = 0
+current_track_index = 0
+last_completed_track = None
+# Arm the tracks from beginning
+osc_client.send_message("/live/track/set/arm", [LOOP_TRACKS[0], 1])
+print(f"Armed track {LOOP_TRACKS[0]} for recording (layer 1)")
 
 # --- Scale setup ---
 ROOT_NOTE = 60  # C4
@@ -115,27 +120,51 @@ def release_note(hand_label):
         midiout.send_message([0x80, current, 0])
         active_note[hand_label] = None
 
-
+# will start recording on selected track not a fixed one
 def start_recording():
-    print("Thumb_Up -> firing clip slot to START recording")
-    osc_client.send_message("/live/clip_slot/fire", [LOOP_TRACK, LOOP_CLIP])
+    track = get_current_track()
+    print(f"Thumb_Up -> START recording on track {track}")
+    osc_client.send_message("/live/clip_slot/fire", [track, LOOP_CLIP])
 
-
+# will automatically stop recording of the chosen track and move forward if clip is available
 def stop_recording():
-    print("Thumb_Down -> firing clip slot to STOP recording (loop begins)")
-    osc_client.send_message("/live/clip_slot/fire", [LOOP_TRACK, LOOP_CLIP])
-    loop_is_playing["Right"] = True
+    global current_track_index, last_completed_track
 
-def toggle_loop_playback():
-    if loop_is_playing["Right"]:
-        print("Victory -> stopping loop")
-        osc_client.send_message("/live/clip/stop", [LOOP_TRACK, LOOP_CLIP])
-        loop_is_playing["Right"] = False
+    track = get_current_track()
+    print(f"Thumb_Down -> STOP recording on track {track} (loop begins)")
+    osc_client.send_message("/live/clip_slot/fire", [track, LOOP_CLIP])
+    loop_is_playing[track] = True
+    last_completed_track = track
+# to stop the right hand notes from going onto the next track
+    osc_client.send_message("/live/track/set/arm", [track, 0])
+
+    if current_track_index < len(LOOP_TRACKS) - 1:
+        current_track_index += 1
+        next_track = get_current_track()
+        osc_client.send_message("/live/track/set/arm", [next_track, 1])
+        print(f"Advanced to track {next_track} for next layer")
     else:
-        print("Victory -> starting loop")
-        osc_client.send_message("/live/clip_slot/fire", [LOOP_TRACK, LOOP_CLIP])
-        loop_is_playing["Right"] = True
+        print("All tracks used - no more layers available")
 
+# toggle loop plays back recent loop now
+def toggle_loop_playback():
+    if last_completed_track is None:
+        print("Victory -> no loop recorded yet")
+        return
+
+    track = last_completed_track
+    if loop_is_playing.get(track, False):
+        print(f"Victory -> stopping loop on track {track}")
+        osc_client.send_message("/live/clip/stop", [track, LOOP_CLIP])
+        loop_is_playing[track] = False
+    else:
+        print(f"Victory -> starting loop on track {track}")
+        osc_client.send_message("/live/clip_slot/fire", [track, LOOP_CLIP])
+        loop_is_playing[track] = True
+
+# helper class for getting the track currently being played
+def get_current_track():
+    return LOOP_TRACKS[current_track_index]
 
 trigger_actions = {
     "Thumb_Up": start_recording,
