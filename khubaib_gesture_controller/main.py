@@ -15,14 +15,20 @@ mp_draw = mp.solutions.drawing_utils
 fps_counter = 0
 fps_timer = time.time()
 
+DEBOUNCE_FRAMES = 3        # STABILITY FOR LEFT GESTURES
+DELETE_HOLD_SECONDS = 1.0  # Major action needs more time to fully recognise
+
+candidate_gesture = {"Left": None}
+candidate_count = {"Left": 0}
+gesture_start_time = {"Left": None}
+last_confirmed_gesture = {"Left": None}
+
 # both hands track independently
 latest_results = {"Left": None, "Right": None}
 last_pinch_value = {"Right": None}
 FREEZE_THRESHOLD = 0.75
 
 previous_gesture = {"Left": None, "Right": None}
-loop_is_playing = {}
-
 frame_timestamp = 0
 
 # --- MIDI setup ---
@@ -33,16 +39,21 @@ midiout.open_port(1)
 ip = "127.0.0.1"
 to_ableton = 11000
 osc_client = SimpleUDPClient(ip, to_ableton)
-
-# Allows multiple recordings
-
+# currently working with three tracks and all their clips
 LOOP_TRACKS = [0, 1, 2]
-LOOP_CLIP = 0
 current_track_index = 0
-last_completed_track = None
-# Arm the tracks from beginning
+
+# next empty slot to record into, and a list of recorded clips same track
+track_state = {
+    track: {"next_clip_index": 0, "recorded_clips": []}
+    for track in LOOP_TRACKS
+}
+
+# Per track and clip playing state for victory toggle
+playing_state = {}
+
 osc_client.send_message("/live/track/set/arm", [LOOP_TRACKS[0], 1])
-print(f"Armed track {LOOP_TRACKS[0]} for recording (layer 1)")
+print(f"Armed track {LOOP_TRACKS[0]} for recording")
 
 # --- Scale setup ---
 ROOT_NOTE = 60  # C4
@@ -120,56 +131,85 @@ def release_note(hand_label):
         midiout.send_message([0x80, current, 0])
         active_note[hand_label] = None
 
-# will start recording on selected track not a fixed one
-def start_recording():
-    track = get_current_track()
-    print(f"Thumb_Up -> START recording on track {track}")
-    osc_client.send_message("/live/clip_slot/fire", [track, LOOP_CLIP])
 
-# will automatically stop recording of the chosen track and move forward if clip is available
-def stop_recording():
-    global current_track_index, last_completed_track
-
-    track = get_current_track()
-    print(f"Thumb_Down -> STOP recording on track {track} (loop begins)")
-    osc_client.send_message("/live/clip_slot/fire", [track, LOOP_CLIP])
-    loop_is_playing[track] = True
-    last_completed_track = track
-# to stop the right hand notes from going onto the next track
-    osc_client.send_message("/live/track/set/arm", [track, 0])
-
-    if current_track_index < len(LOOP_TRACKS) - 1:
-        current_track_index += 1
-        next_track = get_current_track()
-        osc_client.send_message("/live/track/set/arm", [next_track, 1])
-        print(f"Advanced to track {next_track} for next layer")
-    else:
-        print("All tracks used - no more layers available")
-
-# toggle loop plays back recent loop now
-def toggle_loop_playback():
-    if last_completed_track is None:
-        print("Victory -> no loop recorded yet")
-        return
-
-    track = last_completed_track
-    if loop_is_playing.get(track, False):
-        print(f"Victory -> stopping loop on track {track}")
-        osc_client.send_message("/live/clip/stop", [track, LOOP_CLIP])
-        loop_is_playing[track] = False
-    else:
-        print(f"Victory -> starting loop on track {track}")
-        osc_client.send_message("/live/clip_slot/fire", [track, LOOP_CLIP])
-        loop_is_playing[track] = True
-
-# helper class for getting the track currently being played
 def get_current_track():
     return LOOP_TRACKS[current_track_index]
+
+
+def start_recording():
+    track = get_current_track()
+    clip = track_state[track]["next_clip_index"]
+    print(f"Thumb_Up -> START recording on track {track}, clip {clip}")
+    osc_client.send_message("/live/clip_slot/fire", [track, clip])
+
+
+def stop_recording():
+    track = get_current_track()
+    clip = track_state[track]["next_clip_index"]
+    print(f"Thumb_Down -> STOP recording on track {track}, clip {clip} (loop begins)")
+    osc_client.send_message("/live/clip_slot/fire", [track, clip])
+
+    playing_state[(track, clip)] = True
+    track_state[track]["recorded_clips"].append(clip)
+    track_state[track]["next_clip_index"] += 1  # auto advance for next thumbs up
+
+
+def toggle_last_clip():
+    track = get_current_track()
+    recorded = track_state[track]["recorded_clips"]
+
+    if not recorded:
+        print("Victory -> no recorded clip on this track yet")
+        return
+
+    clip = recorded[-1]
+    if playing_state.get((track, clip), False):
+        print(f"Victory -> stopping clip {clip} on track {track}")
+        osc_client.send_message("/live/clip/stop", [track, clip])
+        playing_state[(track, clip)] = False
+    else:
+        print(f"Victory -> starting clip {clip} on track {track}")
+        osc_client.send_message("/live/clip_slot/fire", [track, clip])
+        playing_state[(track, clip)] = True
+
+
+def delete_clip():
+    track = get_current_track()
+    recorded = track_state[track]["recorded_clips"]
+
+    if not recorded:
+        print("Pointing_Up -> nothing to delete on this track")
+        return
+
+    clip = recorded.pop()
+    print(f"Pointing_Up -> deleting clip {clip} on track {track}")
+    osc_client.send_message("/live/clip_slot/delete_clip", [track, clip])
+
+    playing_state.pop((track, clip), None)
+    track_state[track]["next_clip_index"] = clip
+
+
+def move_next_track():
+    global current_track_index
+
+    if current_track_index < len(LOOP_TRACKS) - 1:
+        old_track = get_current_track()
+        osc_client.send_message("/live/track/set/arm", [old_track, 0])
+
+        current_track_index += 1
+        new_track = get_current_track()
+        osc_client.send_message("/live/track/set/arm", [new_track, 1])
+        print(f"ILoveYou -> moved to track {new_track}, clip 0")
+    else:
+        print("ILoveYou -> already on the last track")
+
 
 trigger_actions = {
     "Thumb_Up": start_recording,
     "Thumb_Down": stop_recording,
-    "Victory": toggle_loop_playback
+    "Victory": toggle_last_clip,
+    "Pointing_Up": delete_clip,
+    "ILoveYou": move_next_track,
 }
 
 
@@ -202,7 +242,6 @@ options = vision.GestureRecognizerOptions(
 )
 recognizer = vision.GestureRecognizer.create_from_options(options)
 
-# NEW: DirectShow backend + minimal buffer, both reduce camera-side lag on Windows
 cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -226,9 +265,6 @@ while True:
 
     frame = cv2.flip(frame, 1)
 
-    # NEW: downscale specifically for MediaPipe processing - big speed win.
-    # Landmark coordinates are normalized (0.0-1.0) so they still map
-    # correctly onto the full-size 'frame' below for drawing/display.
     small_frame = cv2.resize(frame, (480, 270))
     frame_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
@@ -275,11 +311,24 @@ while True:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
         if label == "Left":
-            if gesture_name != previous_gesture["Left"]:
-                if gesture_name in trigger_actions:
-                    trigger_actions[gesture_name]()
+            raw = gesture_name
 
-            previous_gesture["Left"] = gesture_name
+            if raw == candidate_gesture["Left"]:
+                candidate_count["Left"] += 1
+            else:
+                candidate_gesture["Left"] = raw
+                candidate_count["Left"] = 1
+                gesture_start_time["Left"] = time.time()
+                last_confirmed_gesture["Left"] = None  # allow re-trigger if it stabilizes again later
+
+            stable_enough = candidate_count["Left"] >= DEBOUNCE_FRAMES
+            required_hold = DELETE_HOLD_SECONDS if raw == "Pointing_Up" else 0
+            held_long_enough = (time.time() - gesture_start_time["Left"]) >= required_hold
+
+            if stable_enough and held_long_enough and last_confirmed_gesture["Left"] != raw:
+                if raw in trigger_actions:
+                    trigger_actions[raw]()
+                last_confirmed_gesture["Left"] = raw
 
     if latest_results["Right"] is None:
         release_note("Right")
