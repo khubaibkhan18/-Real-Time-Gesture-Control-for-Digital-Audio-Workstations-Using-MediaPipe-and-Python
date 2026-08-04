@@ -3,31 +3,49 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 from mediapipe.framework.formats import landmark_pb2
+from pythonosc.udp_client import SimpleUDPClient
 import math
 import json
 import rtmidi
+import time
 
 mp_hands = mp.solutions.hands  # used for HAND_CONNECTIONS
 mp_draw = mp.solutions.drawing_utils
+
+fps_counter = 0
+fps_timer = time.time()
 
 # both hands track independently
 latest_results = {"Left": None, "Right": None}
 last_pinch_value = {"Right": None}
 FREEZE_THRESHOLD = 0.75
 
+previous_gesture = {"Left": None, "Right": None}
+
+frame_timestamp = 0
+
 # --- MIDI setup ---
 midiout = rtmidi.MidiOut()
-print(midiout.get_ports())   # check console - confirm correct port index below
-midiout.open_port(0)         # adjust index based on what's printed above
+print(midiout.get_ports())
+midiout.open_port(1)
+
+ip = "127.0.0.1"
+to_ableton = 11000
+osc_client = SimpleUDPClient(ip, to_ableton)
+
+LOOP_TRACK = 1
+LOOP_CLIP = 0
+
+osc_client.send_message("/live/track/set/arm", [LOOP_TRACK, 1])
+print(f"Armed track {LOOP_TRACK} for recording")
 
 # --- Scale setup ---
 ROOT_NOTE = 60  # C4
-PENTATONIC_INTERVALS = [0, 2, 4, 7, 9]  # major pentatonic semitone steps
-NUM_STEPS = len(PENTATONIC_INTERVALS) * 2  # 2 octaves = 10 steps
+PENTATONIC_INTERVALS = [0, 2, 4, 7, 9]
+NUM_STEPS = len(PENTATONIC_INTERVALS) * 2
 
 active_note = {"Right": None}
 
-# --- Load gesture config ---
 with open("gesture_config.json") as f:
     gesture_config = json.load(f)
 
@@ -44,8 +62,6 @@ def calculate_pinch_distance(landmarks, normalize=True):
     if not normalize:
         return raw_distance
 
-    # wrist-to-middle-knuckle as a stable reference for hand size,
-    # so pinch distance stays consistent regardless of camera distance
     wrist = landmarks[0]
     middle_knuckle = landmarks[9]
     hand_scale = math.sqrt(
@@ -84,12 +100,12 @@ def pinch_to_velocity(pinch_distance):
 def update_note(hand_label, note, velocity):
     current = active_note[hand_label]
     if current == note:
-        return  # already playing this note
+        return
 
     if current is not None:
-        midiout.send_message([0x80, current, 0])  # note off - old note
+        midiout.send_message([0x80, current, 0])
 
-    midiout.send_message([0x90, note, velocity])  # note on - new note
+    midiout.send_message([0x90, note, velocity])
     active_note[hand_label] = note
 
 
@@ -100,10 +116,23 @@ def release_note(hand_label):
         active_note[hand_label] = None
 
 
+def start_recording():
+    print("Thumb_Up -> firing clip slot to START recording")
+    osc_client.send_message("/live/clip_slot/fire", [LOOP_TRACK, LOOP_CLIP])
+
+
+def stop_recording():
+    print("Thumb_Down -> firing clip slot to STOP recording (loop begins)")
+    osc_client.send_message("/live/clip_slot/fire", [LOOP_TRACK, LOOP_CLIP])
+
+
+trigger_actions = {
+    "Thumb_Up": start_recording,
+    "Thumb_Down": stop_recording,
+}
+
+
 def result_callback(result, output_image, timestamp_ms):
-    """
-    Called automatically by MediaPipe after a frame is processed
-    """
     latest_results["Left"] = None
     latest_results["Right"] = None
 
@@ -112,7 +141,7 @@ def result_callback(result, output_image, timestamp_ms):
                                                      result.handedness,
                                                      result.hand_landmarks):
             raw_label = handedness[0].category_name
-            label = "Left" if raw_label == "Right" else "Right"  # image is flipped
+            label = "Left" if raw_label == "Right" else "Right"
             gesture_name = gestures[0].category_name
             latest_results[label] = {
                 "gesture": gesture_name,
@@ -120,20 +149,23 @@ def result_callback(result, output_image, timestamp_ms):
             }
 
 
-# gesture recognizer
 base_options = mp_python.BaseOptions(model_asset_path="gesture_recognizer.task")
 options = vision.GestureRecognizerOptions(
     base_options=base_options,
     running_mode=vision.RunningMode.LIVE_STREAM,
     num_hands=2,
-    min_hand_detection_confidence=0.5,
-    min_hand_presence_confidence=0.5,
-    min_tracking_confidence=0.5,
+    min_hand_detection_confidence=0.3,
+    min_hand_presence_confidence=0.3,
+    min_tracking_confidence=0.3,
     result_callback=result_callback
 )
 recognizer = vision.GestureRecognizer.create_from_options(options)
 
-cap = cv2.VideoCapture(0)
+# NEW: DirectShow backend + minimal buffer, both reduce camera-side lag on Windows
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 if not cap.isOpened():
     print("Webcam Error")
@@ -145,15 +177,24 @@ while True:
         print("Ignoring empty frame from webcam")
         continue
 
-    frame = cv2.flip(frame, 1)
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    fps_counter += 1
+    if time.time() - fps_timer >= 1.0:
+        print(f"FPS: {fps_counter}")
+        fps_counter = 0
+        fps_timer = time.time()
 
+    frame = cv2.flip(frame, 1)
+
+    # NEW: downscale specifically for MediaPipe processing - big speed win.
+    # Landmark coordinates are normalized (0.0-1.0) so they still map
+    # correctly onto the full-size 'frame' below for drawing/display.
+    small_frame = cv2.resize(frame, (480, 270))
+    frame_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 
-    timestamp_ms = int(cv2.getTickCount() / cv2.getTickFrequency() * 1000)
-    recognizer.recognize_async(mp_image, timestamp_ms)
+    frame_timestamp += 1
+    recognizer.recognize_async(mp_image, frame_timestamp)
 
-    # Draw whatever the most recent results were
     for label, data in latest_results.items():
         if data is None:
             continue
@@ -161,7 +202,6 @@ while True:
         landmarks = data["landmarks"]
         gesture_name = data["gesture"]
 
-        # Rebuild landmarks
         proto_landmarks = landmark_pb2.NormalizedLandmarkList()
         proto_landmarks.landmark.extend([
             landmark_pb2.NormalizedLandmark(x=lm.x, y=lm.y, z=lm.z)
@@ -169,7 +209,6 @@ while True:
         ])
         mp_draw.draw_landmarks(frame, proto_landmarks, mp_hands.HAND_CONNECTIONS)
 
-        # gesture label
         wrist = landmarks[0]
         h, w, _ = frame.shape
         text_x, text_y = int(wrist.x * w), int(wrist.y * h) - 20
@@ -177,9 +216,6 @@ while True:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         if label == "Right":
-            # Note control: MIDDLE fingertip Y
-            # Using the middle finger (not index) so pinching for volume
-            # doesn't also disturb the note pitch
             middle_tip = landmarks[12]
             note = fingertip_to_note(middle_tip.y)
 
@@ -193,26 +229,26 @@ while True:
             if pinch_distance is not None:
                 velocity = pinch_to_velocity(pinch_distance)
                 update_note("Right", note, velocity)
-                print(f"Note: {note}  Velocity: {velocity}")
 
                 cv2.putText(frame, f"Pinch: {pinch_distance:.3f}", (text_x, text_y + 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
         if label == "Left":
-            mapping = gesture_config.get("Left", {}).get(gesture_name)
-            if mapping:
-                print(f"Left {gesture_name} -> {mapping['type']}: "
-                      f"{mapping.get('action') or mapping.get('target')}")
+            if gesture_name != previous_gesture["Left"]:
+                if gesture_name in trigger_actions:
+                    trigger_actions[gesture_name]()
 
-    # Release right-hand note if the hand leaves the frame entirely
+            previous_gesture["Left"] = gesture_name
+
     if latest_results["Right"] is None:
         release_note("Right")
 
-    cv2.imshow("Gesture Recognition", frame)
+    display_frame = cv2.resize(frame, (640, 360))
+    cv2.imshow("Gesture Recognition", display_frame)
 
-    if cv2.waitKey(1) & 0xFF == 27:  # Esc to quit
+    if cv2.waitKey(1) & 0xFF == 27:
         break
 
 cap.release()
 cv2.destroyAllWindows()
-release_note("Right")  # avoid a stuck note on exit
+release_note("Right")
