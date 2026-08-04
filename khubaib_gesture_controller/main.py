@@ -21,7 +21,7 @@ last_pinch_value = {"Right": None}
 FREEZE_THRESHOLD = 0.75
 
 previous_gesture = {"Left": None, "Right": None}
-
+loop_is_playing = {"Right": True}
 frame_timestamp = 0
 
 # --- MIDI setup ---
@@ -124,11 +124,23 @@ def start_recording():
 def stop_recording():
     print("Thumb_Down -> firing clip slot to STOP recording (loop begins)")
     osc_client.send_message("/live/clip_slot/fire", [LOOP_TRACK, LOOP_CLIP])
+    loop_is_playing["Right"] = True
+
+def toggle_loop_playback():
+    if loop_is_playing["Right"]:
+        print("Victory -> stopping loop")
+        osc_client.send_message("/live/clip/stop", [LOOP_TRACK, LOOP_CLIP])
+        loop_is_playing["Right"] = False
+    else:
+        print("Victory -> starting loop")
+        osc_client.send_message("/live/clip_slot/fire", [LOOP_TRACK, LOOP_CLIP])
+        loop_is_playing["Right"] = True
 
 
 trigger_actions = {
     "Thumb_Up": start_recording,
     "Thumb_Down": stop_recording,
+    "Victory": toggle_loop_playback
 }
 
 
