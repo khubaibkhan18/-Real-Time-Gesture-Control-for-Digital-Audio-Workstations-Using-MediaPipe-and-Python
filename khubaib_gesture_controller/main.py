@@ -2,96 +2,159 @@ import cv2
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
-from mediapipe.framework.formats import landmark_pb2
 from pythonosc.udp_client import SimpleUDPClient
-import math
 import json
 import rtmidi
 import time
+import math
+import threading
+from pythonosc.dispatcher import Dispatcher
+from pythonosc.osc_server import BlockingOSCUDPServer
 
-mp_hands = mp.solutions.hands  # used for HAND_CONNECTIONS
-mp_draw = mp.solutions.drawing_utils
-
+#FPS tracking, just for my own testing camera was laggy
 fps_counter = 0
 fps_timer = time.time()
 
-DEBOUNCE_FRAMES = 3        # STABILITY FOR LEFT GESTURES
-DELETE_HOLD_SECONDS = 1.0  # Major action needs more time to fully recognise
+# How many frames a Left-hand gesture needs to hold steady before it for gesture confidence
+DEBOUNCE_FRAMES = 2
 
+# Pointing_Up deletes a clip so need longer recognition time
+DELETE_HOLD_SECONDS = 1.0
+
+NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+# Tracks the debounce state for whatever gesture the Left hand is currently showing
 candidate_gesture = {"Left": None}
 candidate_count = {"Left": 0}
 gesture_start_time = {"Left": None}
 last_confirmed_gesture = {"Left": None}
 
-# both hands track independently
+# Holds the most recent gesture detected for both hands
 latest_results = {"Left": None, "Right": None}
-last_pinch_value = {"Right": None}
-FREEZE_THRESHOLD = 0.75
-
-previous_gesture = {"Left": None, "Right": None}
 frame_timestamp = 0
 
-# --- MIDI setup ---
+# MIDIII
+# Port 1 is my loopMIDI virtual port ("from_Python") so any notes are sent through to Ableton via this port
+
 midiout = rtmidi.MidiOut()
 print(midiout.get_ports())
 midiout.open_port(1)
 
+# talks to AbletonOSC, which listens on port 11000
 ip = "127.0.0.1"
 to_ableton = 11000
 osc_client = SimpleUDPClient(ip, to_ableton)
-# currently working with three tracks and all their clips
+
+# Ableton's "1. MIDI", "2. MIDI", "3. MIDI" (basically the tracks)
 LOOP_TRACKS = [0, 1, 2]
 current_track_index = 0
 
-# next empty slot to record into, and a list of recorded clips same track
+# which clip to record into
 track_state = {
     track: {"next_clip_index": 0, "recorded_clips": []}
     for track in LOOP_TRACKS
 }
 
-# Per track and clip playing state for victory toggle
+# checks track state so victory can trigger opposite action
 playing_state = {}
 
+
+for t in LOOP_TRACKS:
+    osc_client.send_message("/live/track/set/current_monitoring_state", [t, 1])
 osc_client.send_message("/live/track/set/arm", [LOOP_TRACKS[0], 1])
 print(f"Armed track {LOOP_TRACKS[0]} for recording")
+print("NOTE: double check each track's Monitor is set to 'Auto' in Ableton if this doesn't take")
 
-# --- Scale setup ---
-ROOT_NOTE = 60  # C4
-PENTATONIC_INTERVALS = [0, 2, 4, 7, 9]
-NUM_STEPS = len(PENTATONIC_INTERVALS) * 2
+# Scale setup
+MAJOR_PENTATONIC = [0, 2, 4, 7, 9]
+MINOR_PENTATONIC = [0, 3, 5, 7, 10]
 
-active_note = {"Right": None}
+scale_info = {"root_note": None, "scale_name": None}
+selected_clip_info = {"track": None, "clip": None}
+
+
+def midi_to_note_name(midi_note):
+    name = NOTE_NAMES[midi_note % 12]
+    octave = midi_note // 12 - 1
+    return f"{name}{octave}"
+
+
+def on_root_note(address, *args):
+    scale_info["root_note"] = args[0]
+
+
+def on_scale_name(address, *args):
+    scale_info["scale_name"] = args[0]
+
+
+def on_selected_clip(address, *args):
+    # so victory triggers selected clip
+    selected_clip_info["track"] = args[0]
+    selected_clip_info["clip"] = args[1]
+
+
+""" Ableton sends its OSC replies back on port 11001, 
+    so I need a small server running to actually receive them """
+
+scale_dispatcher = Dispatcher()
+scale_dispatcher.map("/live/song/get/root_note", on_root_note)
+scale_dispatcher.map("/live/song/get/scale_name", on_scale_name)
+scale_dispatcher.map("/live/view/get/selected_clip", on_selected_clip)
+
+scale_server = BlockingOSCUDPServer((ip, 11001), scale_dispatcher)
+scale_listener_thread = threading.Thread(target=scale_server.serve_forever, daemon=True)
+scale_listener_thread.start()
+
+# Ask Ableton what scale/root it's currently set to
+osc_client.send_message("/live/song/get/root_note", [])
+osc_client.send_message("/live/song/get/scale_name", [])
+time.sleep(0.5)  # give it a moment to actually reply
+
+if scale_info["root_note"] is not None:
+    ROOT_NOTE = 60 + scale_info["root_note"]  # C4 as the base octave if Ableton doesn't respond properly
+else:
+    ROOT_NOTE = 60
+    print("Could not read scale from Ableton - defaulting to C4")
+
+# Sticking to pentatonic specifically as easy to mke mistakes and five notes correspond to five fingers
+
+if scale_info["scale_name"] and "minor" in scale_info["scale_name"].lower():
+    PENTATONIC_INTERVALS = MINOR_PENTATONIC
+    print(f"Using MINOR pentatonic, root {ROOT_NOTE}")
+else:
+    PENTATONIC_INTERVALS = MAJOR_PENTATONIC
+    print(f"Using MAJOR pentatonic, root {ROOT_NOTE}")
+
+active_chord = {"Right": []}
 
 with open("gesture_config.json") as f:
     gesture_config = json.load(f)
 
+STANDARD_VELOCITY = 100
 
-def calculate_pinch_distance(landmarks, normalize=True):
-    thumb_tip = landmarks[4]
-    index_tip = landmarks[8]
-    raw_distance = math.sqrt(
-        (thumb_tip.x - index_tip.x) ** 2 +
-        (thumb_tip.y - index_tip.y) ** 2 +
-        (thumb_tip.z - index_tip.z) ** 2
-    )
+# Debounce for number of fingers detection
+FINGER_DEBOUNCE_FRAMES = 3
 
-    if not normalize:
-        return raw_distance
+# How much farther a fingertip needs to be from its knuckle
+EXTENSION_RATIO = 1.25
+THUMB_EXTENSION_RATIO = 1.15
 
-    wrist = landmarks[0]
-    middle_knuckle = landmarks[9]
-    hand_scale = math.sqrt(
-        (wrist.x - middle_knuckle.x) ** 2 +
-        (wrist.y - middle_knuckle.y) ** 2 +
-        (wrist.z - middle_knuckle.z) ** 2
-    )
+EXPRESSION_CC = 11  # standard MIDI CC
+last_expression_sent = {"Right": None}
 
-    if hand_scale == 0:
-        return raw_distance
+# (tip landmark id, knuckle landmark id) for index, middle, ring, pinky.
+# Thumb caused problems handling separately
+FOUR_FINGER_LANDMARKS = [(8, 5), (12, 9), (16, 13), (20, 17)]
 
-    return raw_distance / hand_scale
+candidate_finger_count = {"Right": None}
+candidate_finger_count_streak = {"Right": 0}
+committed_finger_count = {"Right": 0}
 
 
+def distance(a, b):
+    return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+
+# converting integers to MIDI understandable values
 def convert_range(value, in_min, in_max, out_min, out_max):
     value = max(min(value, max(in_min, in_max)), min(in_min, in_max))
     l_span = in_max - in_min
@@ -99,37 +162,109 @@ def convert_range(value, in_min, in_max, out_min, out_max):
     scaled = (value - in_min) / l_span
     return out_min + (scaled * r_span)
 
-
-def fingertip_to_note(y):
-    step = convert_range(y, 1.0, 0.0, 0, NUM_STEPS - 1)
-    step = int(round(step))
-    octave = step // len(PENTATONIC_INTERVALS)
-    degree = step % len(PENTATONIC_INTERVALS)
-    return ROOT_NOTE + PENTATONIC_INTERVALS[degree] + (octave * 12)
-
-
-def pinch_to_velocity(pinch_distance):
-    velocity = convert_range(pinch_distance, 0.12, 0.75, 0, 127)
-    return int(max(0, min(127, velocity)))
+# Only send message when change is meaningful instead of every frame, was causing lag
+def send_expression(hand_label, value):
+    value = int(max(0, min(127, value)))
+    if last_expression_sent[hand_label] is None or abs(value - last_expression_sent[hand_label]) >= 2:
+        midiout.send_message([0xB0, EXPRESSION_CC, value])
+        last_expression_sent[hand_label] = value
 
 
-def update_note(hand_label, note, velocity):
-    current = active_note[hand_label]
-    if current == note:
+def is_thumb_extended(landmarks):
+    # The thumb folds SIDEWAYS across the palm,
+    tip = landmarks[4]
+    thumb_mcp = landmarks[2]
+    ring_mcp = landmarks[17]
+
+    tip_dist = distance(tip, ring_mcp)
+    mcp_dist = distance(thumb_mcp, ring_mcp)
+    return tip_dist > mcp_dist * THUMB_EXTENSION_RATIO
+
+
+def count_extended_fingers(landmarks):
+    wrist = landmarks[0]
+    count = 0
+
+    for tip_id, mcp_id in FOUR_FINGER_LANDMARKS:
+        tip_dist = distance(landmarks[tip_id], wrist)
+        mcp_dist = distance(landmarks[mcp_id], wrist)
+        if tip_dist > mcp_dist * EXTENSION_RATIO:
+            count += 1
+
+    if is_thumb_extended(landmarks):
+        count += 1
+
+    return count
+
+
+def build_chord(root_step):
+    # Builds a triad using only notes from the pentatonic set itself
+    degrees = len(PENTATONIC_INTERVALS)
+    notes = []
+    for offset in (0, 2, 4):
+        idx = root_step + offset
+        octave = idx // degrees
+        degree = idx % degrees
+        notes.append(ROOT_NOTE + PENTATONIC_INTERVALS[degree] + octave * 12)
+    return notes
+
+
+def update_chord(hand_label, notes, velocity):
+    current = set(active_chord[hand_label])
+    new = set(notes)
+
+    if current == new:
         return
 
-    if current is not None:
-        midiout.send_message([0x80, current, 0])
+    notes_off = current - new
+    notes_on = new - current
 
-    midiout.send_message([0x90, note, velocity])
-    active_note[hand_label] = note
+    for n in notes_off:
+        midiout.send_message([0x80, n, 0])
+
+    # Small gap between messages because Ableton was sending ghost notes (no sound)
+    if notes_off and notes_on:
+        time.sleep(0.005)
+
+    for n in notes_on:
+        midiout.send_message([0x90, n, velocity])
+
+    active_chord[hand_label] = notes
 
 
-def release_note(hand_label):
-    current = active_note[hand_label]
-    if current is not None:
-        midiout.send_message([0x80, current, 0])
-        active_note[hand_label] = None
+def release_chord(hand_label):
+    for n in active_chord[hand_label]:
+        midiout.send_message([0x80, n, 0])
+    active_chord[hand_label] = []
+
+
+def draw_finger_status(frame, finger_count):
+    if finger_count == 0:
+        text = "Fingers: 0  (silent)"
+    else:
+        chord = build_chord(finger_count - 1)
+        names = [midi_to_note_name(n) for n in chord]
+        text = f"Fingers: {finger_count}  ->  {' - '.join(names)}"
+
+    (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, 0.8, 1)
+    pad = 14
+    box_x1, box_y1 = 20, 20
+    box_x2, box_y2 = box_x1 + text_w + pad * 2, box_y1 + text_h + pad * 2
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (box_x1, box_y1), (box_x2, box_y2), (40, 40, 40), -1)
+    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+
+    cv2.putText(frame, text, (box_x1 + pad, box_y2 - pad),
+                cv2.FONT_HERSHEY_DUPLEX, 0.8, (210, 210, 210), 1, cv2.LINE_AA)
+
+
+def draw_landmark_dots(frame, landmarks):
+    # Just dots
+    h, w, _ = frame.shape
+    for lm in landmarks:
+        x, y = int(lm.x * w), int(lm.y * h)
+        cv2.circle(frame, (x, y), 4, (0, 220, 0), -1)
 
 
 def get_current_track():
@@ -151,29 +286,33 @@ def stop_recording():
 
     playing_state[(track, clip)] = True
     track_state[track]["recorded_clips"].append(clip)
-    track_state[track]["next_clip_index"] += 1  # auto advance for next thumbs up
+    track_state[track]["next_clip_index"] += 1  # so the next Thumb_Up records a NEW clip
 
 
 def toggle_last_clip():
-    track = get_current_track()
-    recorded = track_state[track]["recorded_clips"]
+    # Victory targets whatever clip is currently selected/highlighted
+    osc_client.send_message("/live/view/get/selected_clip", [])
+    time.sleep(0.05)
 
-    if not recorded:
-        print("Victory -> no recorded clip on this track yet")
+    track = selected_clip_info["track"]
+    clip = selected_clip_info["clip"]
+
+    if track is None or clip is None:
+        print("Victory -> no clip currently selected in Ableton")
         return
 
-    clip = recorded[-1]
     if playing_state.get((track, clip), False):
-        print(f"Victory -> stopping clip {clip} on track {track}")
+        print(f"Victory -> stopping selected clip {clip} on track {track}")
         osc_client.send_message("/live/clip/stop", [track, clip])
         playing_state[(track, clip)] = False
     else:
-        print(f"Victory -> starting clip {clip} on track {track}")
+        print(f"Victory -> starting selected clip {clip} on track {track}")
         osc_client.send_message("/live/clip_slot/fire", [track, clip])
         playing_state[(track, clip)] = True
 
 
 def delete_clip():
+    # Only deletes the most recently recorded clip on the current track
     track = get_current_track()
     recorded = track_state[track]["recorded_clips"]
 
@@ -186,7 +325,7 @@ def delete_clip():
     osc_client.send_message("/live/clip_slot/delete_clip", [track, clip])
 
     playing_state.pop((track, clip), None)
-    track_state[track]["next_clip_index"] = clip
+    track_state[track]["next_clip_index"] = clip  # free up this slot for re-recording
 
 
 def move_next_track():
@@ -214,6 +353,7 @@ trigger_actions = {
 
 
 def result_callback(result, output_image, timestamp_ms):
+    # Called automatically by MediaPipe once it finishes processing a frame
     latest_results["Left"] = None
     latest_results["Right"] = None
 
@@ -222,6 +362,7 @@ def result_callback(result, output_image, timestamp_ms):
                                                      result.handedness,
                                                      result.hand_landmarks):
             raw_label = handedness[0].category_name
+            # We flip the camera frame for a natural mirror view
             label = "Left" if raw_label == "Right" else "Right"
             gesture_name = gestures[0].category_name
             latest_results[label] = {
@@ -242,6 +383,7 @@ options = vision.GestureRecognizerOptions(
 )
 recognizer = vision.GestureRecognizer.create_from_options(options)
 
+# DirectShow backend and small buffer for less lag
 cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -272,6 +414,8 @@ while True:
     frame_timestamp += 1
     recognizer.recognize_async(mp_image, frame_timestamp)
 
+    draw_finger_status(frame, committed_finger_count["Right"])
+
     for label, data in latest_results.items():
         if data is None:
             continue
@@ -279,37 +423,39 @@ while True:
         landmarks = data["landmarks"]
         gesture_name = data["gesture"]
 
-        proto_landmarks = landmark_pb2.NormalizedLandmarkList()
-        proto_landmarks.landmark.extend([
-            landmark_pb2.NormalizedLandmark(x=lm.x, y=lm.y, z=lm.z)
-            for lm in landmarks
-        ])
-        mp_draw.draw_landmarks(frame, proto_landmarks, mp_hands.HAND_CONNECTIONS)
+        draw_landmark_dots(frame, landmarks)
 
-        wrist = landmarks[0]
+        wrist_lm = landmarks[0]
         h, w, _ = frame.shape
-        text_x, text_y = int(wrist.x * w), int(wrist.y * h) - 20
+        text_x, text_y = int(wrist_lm.x * w), int(wrist_lm.y * h) - 20
         cv2.putText(frame, f"{label}: {gesture_name}", (text_x, text_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
+        # RIGHT HAND ONLY: notes, chords, and volume all live here.
         if label == "Right":
-            middle_tip = landmarks[12]
-            note = fingertip_to_note(middle_tip.y)
+            raw_count = count_extended_fingers(landmarks)
 
-            raw_pinch = calculate_pinch_distance(landmarks)
-            if raw_pinch < FREEZE_THRESHOLD:
-                last_pinch_value["Right"] = raw_pinch
-                pinch_distance = raw_pinch
+            if raw_count == candidate_finger_count["Right"]:
+                candidate_finger_count_streak["Right"] += 1
             else:
-                pinch_distance = last_pinch_value["Right"]
+                candidate_finger_count["Right"] = raw_count
+                candidate_finger_count_streak["Right"] = 1
 
-            if pinch_distance is not None:
-                velocity = pinch_to_velocity(pinch_distance)
-                update_note("Right", note, velocity)
+            if (candidate_finger_count_streak["Right"] >= FINGER_DEBOUNCE_FRAMES
+                    and raw_count != committed_finger_count["Right"]):
+                committed_finger_count["Right"] = raw_count
 
-                cv2.putText(frame, f"Pinch: {pinch_distance:.3f}", (text_x, text_y + 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                if raw_count == 0:
+                    release_chord("Right")
+                else:
+                    chord = build_chord(raw_count - 1)
+                    update_chord("Right", chord, STANDARD_VELOCITY)
 
+            volume = convert_range(wrist_lm.y, 1.0, 0.0, 20, 127)
+            send_expression("Right", volume)
+
+        # LEFT HAND ONLY: discrete trigger gestures for loop recording, stopping,
+        # toggle, moving to tracks and clips deleting
         if label == "Left":
             raw = gesture_name
 
@@ -319,7 +465,7 @@ while True:
                 candidate_gesture["Left"] = raw
                 candidate_count["Left"] = 1
                 gesture_start_time["Left"] = time.time()
-                last_confirmed_gesture["Left"] = None  # allow re-trigger if it stabilizes again later
+                last_confirmed_gesture["Left"] = None
 
             stable_enough = candidate_count["Left"] >= DEBOUNCE_FRAMES
             required_hold = DELETE_HOLD_SECONDS if raw == "Pointing_Up" else 0
@@ -331,14 +477,15 @@ while True:
                 last_confirmed_gesture["Left"] = raw
 
     if latest_results["Right"] is None:
-        release_note("Right")
+        release_chord("Right")
+        committed_finger_count["Right"] = 0
 
-    display_frame = cv2.resize(frame, (640, 360))
+    display_frame = cv2.resize(frame, (960, 540))
     cv2.imshow("Gesture Recognition", display_frame)
 
-    if cv2.waitKey(1) & 0xFF == 27:
+    if cv2.waitKey(1) & 0xFF == 27:  # Esc to quit
         break
 
 cap.release()
 cv2.destroyAllWindows()
-release_note("Right")
+release_chord("Right")  # don't leave a note hanging when the script closes
